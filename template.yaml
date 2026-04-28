@@ -1,0 +1,1325 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: ShopEase E-Commerce Platform
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment stage used to namespace all resources
+
+Globals:
+  Function:
+    Runtime: nodejs18.x
+    Timeout: 30
+    MemorySize: 256
+    Layers:
+      - !Ref SharedLayer
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        USERS_TABLE: !Sub shopease-${Stage}-Users
+        PRODUCTS_TABLE: !Sub shopease-${Stage}-Products
+        CATEGORIES_TABLE: !Sub shopease-${Stage}-Categories
+        CARTS_TABLE: !Sub shopease-${Stage}-Carts
+        ORDERS_TABLE: !Sub shopease-${Stage}-Orders
+        ORDER_ITEMS_TABLE: !Sub shopease-${Stage}-OrderItems
+        COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+        COGNITO_CLIENT_ID: !Ref CognitoAppClient
+        PRODUCT_IMAGES_BUCKET: !Sub shopease-${Stage}-product-images
+
+Resources:
+
+  # ─── DynamoDB Tables ────────────────────────────────────────────────────────
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub shopease-${Stage}-Users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub shopease-${Stage}-Products
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+        - AttributeName: categoryId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CategoryIndex
+          KeySchema:
+            - AttributeName: categoryId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  CategoriesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub shopease-${Stage}-Categories
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: categoryId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: categoryId
+          KeyType: HASH
+
+  CartsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub shopease-${Stage}-Carts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: productId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: productId
+          KeyType: RANGE
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub shopease-${Stage}-Orders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserOrdersIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  OrderItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub shopease-${Stage}-OrderItems
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: productId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+        - AttributeName: productId
+          KeyType: RANGE
+
+  # ─── Lambda Layer ────────────────────────────────────────────────────────────
+
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub shopease-${Stage}-shared-layer
+      Description: Shared utilities for ShopEase Lambda functions
+      ContentUri: src/layer/nodejs/
+      CompatibleRuntimes:
+        - nodejs18.x
+      RetentionPolicy: Delete
+
+  # ─── Cognito User Pool ───────────────────────────────────────────────────────
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub shopease-${Stage}-user-pool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: false
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      LambdaConfig:
+        PostConfirmation: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:shopease-${Stage}-post-confirmation
+
+  CognitoAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub shopease-${Stage}-app-client
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  CognitoCustomerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Customer
+      UserPoolId: !Ref CognitoUserPool
+      Description: Standard customer group
+
+  CognitoAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Admin
+      UserPoolId: !Ref CognitoUserPool
+      Description: Admin group with elevated privileges
+
+  # ─── S3 Buckets ─────────────────────────────────────────────────────────────
+
+  ProductImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub shopease-${Stage}-product-images
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods:
+              - PUT
+            AllowedOrigins:
+              - '*'
+            AllowedHeaders:
+              - Content-Type
+            MaxAge: 3600
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub shopease-${Stage}-frontend
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::shopease-${Stage}-frontend/*
+
+  # ─── API Gateway ─────────────────────────────────────────────────────────────
+
+  ShopEaseApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub shopease-${Stage}-api
+      StageName: !Ref Stage
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+            Identity:
+              Header: Authorization
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+        MaxAge: "'600'"
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseTemplates:
+            application/json: '{"error": "$context.error.messageString"}'
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        DEFAULT_5XX:
+          ResponseTemplates:
+            application/json: '{"error": "$context.error.messageString"}'
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+      Models:
+        RegisterModel:
+          type: object
+          required:
+            - email
+            - password
+            - name
+            - phoneNumber
+          properties:
+            email:
+              type: string
+              format: email
+            password:
+              type: string
+              minLength: 8
+            name:
+              type: string
+              minLength: 1
+            phoneNumber:
+              type: string
+        LoginModel:
+          type: object
+          required:
+            - email
+            - password
+          properties:
+            email:
+              type: string
+            password:
+              type: string
+        VerifyModel:
+          type: object
+          required:
+            - email
+            - code
+          properties:
+            email:
+              type: string
+            code:
+              type: string
+        ForgotPasswordModel:
+          type: object
+          required:
+            - email
+          properties:
+            email:
+              type: string
+        ConfirmPasswordModel:
+          type: object
+          required:
+            - email
+            - code
+            - newPassword
+          properties:
+            email:
+              type: string
+            code:
+              type: string
+            newPassword:
+              type: string
+              minLength: 8
+        CreateProductModel:
+          type: object
+          required:
+            - name
+            - description
+            - price
+            - stockQuantity
+            - categoryId
+            - imageKeys
+          properties:
+            name:
+              type: string
+              minLength: 1
+            description:
+              type: string
+            price:
+              type: number
+              minimum: 0.01
+            stockQuantity:
+              type: integer
+              minimum: 0
+            categoryId:
+              type: string
+            imageKeys:
+              type: array
+              items:
+                type: string
+              minItems: 1
+        UpdateProductModel:
+          type: object
+          properties:
+            name:
+              type: string
+              minLength: 1
+            description:
+              type: string
+            price:
+              type: number
+              minimum: 0.01
+            stockQuantity:
+              type: integer
+              minimum: 0
+            categoryId:
+              type: string
+            imageKeys:
+              type: array
+              items:
+                type: string
+        CreateCategoryModel:
+          type: object
+          required:
+            - name
+          properties:
+            name:
+              type: string
+              minLength: 1
+        AddCartItemModel:
+          type: object
+          required:
+            - productId
+            - quantity
+          properties:
+            productId:
+              type: string
+            quantity:
+              type: integer
+              minimum: 1
+        UpdateCartItemModel:
+          type: object
+          required:
+            - quantity
+          properties:
+            quantity:
+              type: integer
+        PlaceOrderModel:
+          type: object
+          properties: {}
+        UpdateOrderStatusModel:
+          type: object
+          required:
+            - status
+          properties:
+            status:
+              type: string
+              enum:
+                - Processing
+                - Shipped
+                - Delivered
+
+  # ─── IAM Managed Policies (base policies for reuse) ──────────────────────────
+
+  # Base DynamoDB read policy for Users table
+  UsersTableReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-users-read
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+            Resource:
+              - !GetAtt UsersTable.Arn
+
+  UsersTableWritePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-users-write
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+            Resource:
+              - !GetAtt UsersTable.Arn
+
+  ProductsTableReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-products-read
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:BatchGetItem
+            Resource:
+              - !GetAtt ProductsTable.Arn
+              - !Sub ${ProductsTable.Arn}/index/*
+
+  ProductsTableWritePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-products-write
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+            Resource:
+              - !GetAtt ProductsTable.Arn
+
+  CategoriesTableReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-categories-read
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+            Resource:
+              - !GetAtt CategoriesTable.Arn
+
+  CategoriesTableWritePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-categories-write
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+            Resource:
+              - !GetAtt CategoriesTable.Arn
+
+  CartsTableReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-carts-read
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+            Resource:
+              - !GetAtt CartsTable.Arn
+
+  CartsTableWritePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-carts-write
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+            Resource:
+              - !GetAtt CartsTable.Arn
+
+  OrdersTableReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-orders-read
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:BatchGetItem
+            Resource:
+              - !GetAtt OrdersTable.Arn
+              - !Sub ${OrdersTable.Arn}/index/*
+
+  OrdersTableWritePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-orders-write
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:TransactWriteItems
+            Resource:
+              - !GetAtt OrdersTable.Arn
+              - !GetAtt OrderItemsTable.Arn
+              - !GetAtt ProductsTable.Arn
+              - !GetAtt CartsTable.Arn
+
+  OrderItemsTableReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-order-items-read
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+            Resource:
+              - !GetAtt OrderItemsTable.Arn
+
+  ProductImagesPutPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-images-put
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+            Resource: !Sub arn:aws:s3:::shopease-${Stage}-product-images/*
+
+  # ─── Per-Function IAM Roles ──────────────────────────────────────────────────
+
+  LambdaBasicExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub shopease-${Stage}-lambda-basic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+
+  # Auth Service Role — Cognito only
+  AuthServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub shopease-${Stage}-auth-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaBasicExecutionPolicy
+      Policies:
+        - PolicyName: CognitoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:SignUp
+                  - cognito-idp:ConfirmSignUp
+                  - cognito-idp:ResendConfirmationCode
+                  - cognito-idp:InitiateAuth
+                  - cognito-idp:ForgotPassword
+                  - cognito-idp:ConfirmForgotPassword
+                  - cognito-idp:AdminAddUserToGroup
+                Resource: !GetAtt CognitoUserPool.Arn
+
+  # Post-Confirmation trigger role — writes to Users table
+  PostConfirmationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub shopease-${Stage}-post-confirmation-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaBasicExecutionPolicy
+        - !Ref UsersTableWritePolicy
+
+  # User Service Role — read/write Users table
+  UserServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub shopease-${Stage}-user-service-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaBasicExecutionPolicy
+        - !Ref UsersTableReadPolicy
+        - !Ref UsersTableWritePolicy
+
+  # Product Service Role — read/write Products + Categories tables
+  ProductServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub shopease-${Stage}-product-service-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaBasicExecutionPolicy
+        - !Ref ProductsTableReadPolicy
+        - !Ref ProductsTableWritePolicy
+        - !Ref CategoriesTableReadPolicy
+        - !Ref CategoriesTableWritePolicy
+
+  # Cart Service Role — read/write Carts + read Products
+  CartServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub shopease-${Stage}-cart-service-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaBasicExecutionPolicy
+        - !Ref CartsTableReadPolicy
+        - !Ref CartsTableWritePolicy
+        - !Ref ProductsTableReadPolicy
+
+  # Order Service Role — transact write across Orders, OrderItems, Products, Carts + read Users
+  OrderServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub shopease-${Stage}-order-service-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaBasicExecutionPolicy
+        - !Ref OrdersTableReadPolicy
+        - !Ref OrdersTableWritePolicy
+        - !Ref OrderItemsTableReadPolicy
+        - !Ref CartsTableReadPolicy
+        - !Ref ProductsTableReadPolicy
+        - !Ref UsersTableReadPolicy
+
+  # Image Service Role — read Products + put S3 signed URLs
+  ImageServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub shopease-${Stage}-image-service-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LambdaBasicExecutionPolicy
+        - !Ref ProductsTableReadPolicy
+        - !Ref ProductImagesPutPolicy
+
+  # ─── Auth Service Lambda Functions ─────────────────────────────────────────
+
+  RegisterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-register
+      CodeUri: src/functions/auth/
+      Handler: register.handler
+      Role: !GetAtt AuthServiceRole.Arn
+      Events:
+        RegisterApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/auth/register
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  VerifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-verify
+      CodeUri: src/functions/auth/
+      Handler: verify.handler
+      Role: !GetAtt AuthServiceRole.Arn
+      Events:
+        VerifyApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/auth/verify
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  ResendVerificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-resend-verification
+      CodeUri: src/functions/auth/
+      Handler: resendVerification.handler
+      Role: !GetAtt AuthServiceRole.Arn
+      Events:
+        ResendVerificationApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/auth/resend-verification
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  LoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-login
+      CodeUri: src/functions/auth/
+      Handler: login.handler
+      Role: !GetAtt AuthServiceRole.Arn
+      Events:
+        LoginApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/auth/login
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  ForgotPasswordFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-forgot-password
+      CodeUri: src/functions/auth/
+      Handler: forgotPassword.handler
+      Role: !GetAtt AuthServiceRole.Arn
+      Events:
+        ForgotPasswordApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/auth/forgot-password
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  ConfirmPasswordFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-confirm-password
+      CodeUri: src/functions/auth/
+      Handler: confirmPassword.handler
+      Role: !GetAtt AuthServiceRole.Arn
+      Events:
+        ConfirmPasswordApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/auth/confirm-password
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  PostConfirmationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-post-confirmation
+      CodeUri: src/functions/auth/
+      Handler: postConfirmation.handler
+      Role: !GetAtt PostConfirmationRole.Arn
+
+  PostConfirmationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt PostConfirmationFunction.Arn
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt CognitoUserPool.Arn
+
+  # ─── User Service Lambda Functions ─────────────────────────────────────────
+
+  GetProfileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-get-profile
+      CodeUri: src/functions/users/
+      Handler: getProfile.handler
+      Role: !GetAtt UserServiceRole.Arn
+      Events:
+        GetProfileApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/users/me
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  UpdateProfileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-update-profile
+      CodeUri: src/functions/users/
+      Handler: updateProfile.handler
+      Role: !GetAtt UserServiceRole.Arn
+      Events:
+        UpdateProfileApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/users/me
+            Method: PUT
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ─── Product Service — Category Lambda Functions ────────────────────────────
+
+  CreateCategoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-create-category
+      CodeUri: src/functions/products/
+      Handler: createCategory.handler
+      Role: !GetAtt ProductServiceRole.Arn
+      Events:
+        CreateCategoryApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/categories
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  ListCategoriesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-list-categories
+      CodeUri: src/functions/products/
+      Handler: listCategories.handler
+      Role: !GetAtt ProductServiceRole.Arn
+      Events:
+        ListCategoriesApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/categories
+            Method: GET
+            Auth:
+              Authorizer: NONE
+
+  DeleteCategoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-delete-category
+      CodeUri: src/functions/products/
+      Handler: deleteCategory.handler
+      Role: !GetAtt ProductServiceRole.Arn
+      Events:
+        DeleteCategoryApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/categories/{categoryId}
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ─── Product Service — Product CRUD Lambda Functions ───────────────────────
+
+  CreateProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-create-product
+      CodeUri: src/functions/products/
+      Handler: createProduct.handler
+      Role: !GetAtt ProductServiceRole.Arn
+      Events:
+        CreateProductApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/products
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  UpdateProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-update-product
+      CodeUri: src/functions/products/
+      Handler: updateProduct.handler
+      Role: !GetAtt ProductServiceRole.Arn
+      Events:
+        UpdateProductApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/products/{productId}
+            Method: PUT
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  DeleteProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-delete-product
+      CodeUri: src/functions/products/
+      Handler: deleteProduct.handler
+      Role: !GetAtt ProductServiceRole.Arn
+      Events:
+        DeleteProductApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/products/{productId}
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  ListProductsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-list-products
+      CodeUri: src/functions/products/
+      Handler: listProducts.handler
+      Role: !GetAtt ProductServiceRole.Arn
+      Events:
+        ListProductsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/products
+            Method: GET
+            Auth:
+              Authorizer: NONE
+
+  GetProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-get-product
+      CodeUri: src/functions/products/
+      Handler: getProduct.handler
+      Role: !GetAtt ProductServiceRole.Arn
+      Events:
+        GetProductApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/products/{productId}
+            Method: GET
+            Auth:
+              Authorizer: NONE
+
+  # ─── Cart Service Lambda Functions ────────────────────────────────────────
+
+  AddCartItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-add-cart-item
+      CodeUri: src/functions/cart/
+      Handler: addItem.handler
+      Role: !GetAtt CartServiceRole.Arn
+      Events:
+        AddCartItemApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/cart/items
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  UpdateCartItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-update-cart-item
+      CodeUri: src/functions/cart/
+      Handler: updateItem.handler
+      Role: !GetAtt CartServiceRole.Arn
+      Events:
+        UpdateCartItemApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/cart/items/{productId}
+            Method: PUT
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  RemoveCartItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-remove-cart-item
+      CodeUri: src/functions/cart/
+      Handler: removeItem.handler
+      Role: !GetAtt CartServiceRole.Arn
+      Events:
+        RemoveCartItemApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/cart/items/{productId}
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  GetCartFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-get-cart
+      CodeUri: src/functions/cart/
+      Handler: getCart.handler
+      Role: !GetAtt CartServiceRole.Arn
+      Events:
+        GetCartApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/cart
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ─── Order Service Lambda Functions ────────────────────────────────────────
+
+  PlaceOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-place-order
+      CodeUri: src/functions/orders/
+      Handler: placeOrder.handler
+      Role: !GetAtt OrderServiceRole.Arn
+      Events:
+        PlaceOrderApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/orders
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  ListOrdersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-list-orders
+      CodeUri: src/functions/orders/
+      Handler: listOrders.handler
+      Role: !GetAtt OrderServiceRole.Arn
+      Events:
+        ListOrdersApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/orders
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  GetOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-get-order
+      CodeUri: src/functions/orders/
+      Handler: getOrder.handler
+      Role: !GetAtt OrderServiceRole.Arn
+      Events:
+        GetOrderApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/orders/{orderId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  UpdateOrderStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-update-order-status
+      CodeUri: src/functions/orders/
+      Handler: updateOrderStatus.handler
+      Role: !GetAtt OrderServiceRole.Arn
+      Events:
+        UpdateOrderStatusApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/orders/{orderId}/status
+            Method: PUT
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  ListAllOrdersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-list-all-orders
+      CodeUri: src/functions/orders/
+      Handler: listAllOrders.handler
+      Role: !GetAtt OrderServiceRole.Arn
+      Events:
+        ListAllOrdersApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/admin/orders
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ─── Image Service Lambda Functions ────────────────────────────────────────
+
+  GetUploadUrlsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-get-upload-urls
+      CodeUri: src/functions/images/
+      Handler: getUploadUrls.handler
+      Role: !GetAtt ImageServiceRole.Arn
+      Events:
+        GetUploadUrlsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/products/{productId}/images/upload-urls
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  GetUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub shopease-${Stage}-get-upload-url
+      CodeUri: src/functions/images/
+      Handler: getUploadUrl.handler
+      Role: !GetAtt ImageServiceRole.Arn
+      Events:
+        GetUploadUrlApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ShopEaseApi
+            Path: /v1/admin/products/upload-url
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+Outputs:
+
+  ApiGatewayUrl:
+    Description: API Gateway base URL
+    Value: !Sub https://${ShopEaseApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/v1
+    Export:
+      Name: !Sub shopease-${Stage}-ApiGatewayUrl
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub shopease-${Stage}-CognitoUserPoolId
+
+  CognitoAppClientId:
+    Description: Cognito App Client ID
+    Value: !Ref CognitoAppClient
+    Export:
+      Name: !Sub shopease-${Stage}-CognitoAppClientId
+
+  ProductImagesBucketName:
+    Description: S3 bucket name for product images
+    Value: !Ref ProductImagesBucket
+    Export:
+      Name: !Sub shopease-${Stage}-ProductImagesBucketName
+
+  FrontendBucketName:
+    Description: S3 bucket name for static frontend
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub shopease-${Stage}-FrontendBucketName
+
+  FrontendWebsiteUrl:
+    Description: Static website URL for the frontend bucket
+    Value: !GetAtt FrontendBucket.WebsiteURL
+    Export:
+      Name: !Sub shopease-${Stage}-FrontendWebsiteUrl

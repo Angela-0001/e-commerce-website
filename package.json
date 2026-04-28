@@ -1,0 +1,20 @@
+{
+  "name": "shopease-ecommerce",
+  "version": "1.0.0",
+  "description": "ShopEase serverless e-commerce platform",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest --runInBand",
+    "test:unit": "jest tests/unit --runInBand",
+    "test:property": "jest tests/property --runInBand"
+  },
+  "dependencies": {
+    "aws-sdk": "^2.1500.0"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1032.0",
+    "@aws-sdk/lib-dynamodb": "^3.1032.0",
+    "fast-check": "^3.15.0",
+    "jest": "^29.7.0"
+  }
+}

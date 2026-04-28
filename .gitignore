@@ -1,0 +1,16 @@
+node_modules/
+.aws-sam/
+frontend/node_modules/
+frontend/build/
+frontend/.env
+*.zip
+*.json.bak
+samconfig.toml
+out.json
+out2.json
+seed.js
+cors.json
+bucket-policy.json
+website.json
+deploy-*.zip
+*.zip
